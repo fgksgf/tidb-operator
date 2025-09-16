@@ -17,6 +17,7 @@ package waiter
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -46,12 +47,21 @@ func WaitForObject(
 	var lastErr error
 	if err := wait.PollUntilContextTimeout(ctx, Poll, timeout, true, func(ctx context.Context) (bool, error) {
 		key := client.ObjectKeyFromObject(obj)
-		if err := c.Get(ctx, key, obj); err != nil {
+		// Create a fresh copy to avoid data race when multiple goroutines access the same object
+		fresh := obj.DeepCopyObject().(client.Object)
+		if err := c.Get(ctx, key, fresh); err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil
 			}
 
 			return false, fmt.Errorf("can't get obj %s: %w", key, err)
+		}
+
+		// Use reflection to safely copy the fresh data back to original object
+		objValue := reflect.ValueOf(obj)
+		freshValue := reflect.ValueOf(fresh)
+		if objValue.Kind() == reflect.Ptr && freshValue.Kind() == reflect.Ptr {
+			objValue.Elem().Set(freshValue.Elem())
 		}
 
 		if err := cond(); err != nil {
@@ -71,6 +81,46 @@ func WaitForObject(
 	return nil
 }
 
+// WaitForObjectV2Safe waits for the object to meet the condition without modifying the original object
+// to avoid data race when multiple goroutines access the same object
+func WaitForObjectV2Safe(
+	ctx context.Context,
+	c client.Client,
+	obj client.Object,
+	cond func(client.Object) (stop bool, _ error),
+	timeout time.Duration,
+) error {
+	var lastErr error
+	if err := wait.PollUntilContextTimeout(ctx, Poll, timeout, true, func(ctx context.Context) (bool, error) {
+		key := client.ObjectKeyFromObject(obj)
+		// Create a fresh copy to avoid data race
+		fresh := obj.DeepCopyObject().(client.Object)
+		if err := c.Get(ctx, key, fresh); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return false, fmt.Errorf("can't get obj %s: %w", key, err)
+		}
+
+		stop, err := cond(fresh)
+		if err != nil {
+			lastErr = err
+			return false, nil
+		}
+
+		return stop, nil
+	}); err != nil {
+		if lastErr != nil {
+			return lastErr
+		}
+
+		return err
+	}
+
+	return nil
+}
+
 func WaitForObjectV2(
 	ctx context.Context,
 	c client.Client,
@@ -81,12 +131,21 @@ func WaitForObjectV2(
 	var lastErr error
 	if err := wait.PollUntilContextTimeout(ctx, Poll, timeout, true, func(ctx context.Context) (bool, error) {
 		key := client.ObjectKeyFromObject(obj)
-		if err := c.Get(ctx, key, obj); err != nil {
+		// Create a fresh copy to avoid data race when multiple goroutines access the same object
+		fresh := obj.DeepCopyObject().(client.Object)
+		if err := c.Get(ctx, key, fresh); err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil
 			}
 
 			return false, fmt.Errorf("can't get obj %s: %w", key, err)
+		}
+
+		// Use reflection to safely copy the fresh data back to original object
+		objValue := reflect.ValueOf(obj)
+		freshValue := reflect.ValueOf(fresh)
+		if objValue.Kind() == reflect.Ptr && freshValue.Kind() == reflect.Ptr {
+			objValue.Elem().Set(freshValue.Elem())
 		}
 
 		stop, err := cond()
