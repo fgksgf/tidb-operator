@@ -17,11 +17,13 @@ package volumes
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/pingcap/tidb-operator/pkg/client"
 	timeutils "github.com/pingcap/tidb-operator/pkg/utils/time"
@@ -31,6 +33,12 @@ import (
 )
 
 var _ Modifier = &rawModifier{}
+
+// Cloud provider annotation prefixes that should be preserved during operations
+var cloudAnnotationPrefixes = []string{
+	"azure.tidb.pingcap.com/",
+	"aws.tidb.pingcap.com/",
+}
 
 // rawModifier modifies volumes by calling cloud provider API.
 type rawModifier struct {
@@ -115,9 +123,46 @@ func (m *rawModifier) Modify(ctx context.Context, vol *ActualVolume) error {
 			return fmt.Errorf("no cloud volume modifier for storage class provisioner %s", vol.StorageClass.Provisioner)
 		}
 		wait, err := modifier.Modify(ctx, pvc, vol.PV, vol.Desired.StorageClass)
+
+		// Merge ONLY cloud-specific annotations from modifier back to vol.PVC regardless of error
+		// This ensures rollback annotations (e.g., removeLastModification) are captured
+		// while preserving other controllers' annotations.
+		if pvc.Annotations != nil {
+			if vol.PVC.Annotations == nil {
+				vol.PVC.Annotations = make(map[string]string)
+			}
+			for k, v := range pvc.Annotations {
+				// Only merge cloud-specific annotations
+				isCloudAnnotation := false
+				for _, prefix := range cloudAnnotationPrefixes {
+					if strings.HasPrefix(k, prefix) {
+						isCloudAnnotation = true
+						break
+					}
+				}
+				if isCloudAnnotation {
+					vol.PVC.Annotations[k] = v
+				}
+			}
+		}
+
+		// Persist annotations immediately to ensure cloud-specific metadata is not lost.
+		// This is critical for Azure rate limiting which tracks modification history in annotations.
+		// Must happen even when modifier.Modify() returns error, to persist rollback changes.
+		if persistErr := m.updatePVCAnnotations(ctx, vol); persistErr != nil {
+			if err != nil {
+				// Both modifier and persistence failed
+				return fmt.Errorf("failed to persist cloud-specific metadata after modifier error %w: %w", err, persistErr)
+			}
+			// Only persistence failed
+			return fmt.Errorf("failed to persist cloud-specific metadata: %w", persistErr)
+		}
+
+		// Now check if modifier itself failed
 		if err != nil {
 			return err
 		}
+
 		if wait {
 			return &WaitError{Message: fmt.Sprintf("wait for volume %s/%s modification completed", vol.PVC.Namespace, vol.PVC.Name)}
 		}
@@ -275,6 +320,60 @@ func (m *rawModifier) syncPVCSize(ctx context.Context, vol *ActualVolume) (bool,
 
 	vol.PVC = pvc
 	return false, nil
+}
+
+// updatePVCAnnotations updates PVC annotations with retry on conflict.
+// This ensures cloud-specific metadata (e.g., Azure modification history) is persisted
+// atomically using Kubernetes optimistic locking (resourceVersion).
+func (m *rawModifier) updatePVCAnnotations(ctx context.Context, vol *ActualVolume) error {
+	const maxRetries = 3
+	pvc := vol.PVC
+
+	for i := 0; i < maxRetries; i++ {
+		if err := m.k8sClient.Update(ctx, pvc); err != nil {
+			if errors.IsConflict(err) {
+				// Conflict detected: another controller updated the PVC.
+				// Re-fetch and retry with latest resourceVersion.
+				m.logger.Info("PVC update conflict detected, retrying",
+					"namespace", pvc.Namespace, "name", pvc.Name, "attempt", i+1)
+
+				// Re-fetch PVC to get latest resourceVersion
+				fresh := &corev1.PersistentVolumeClaim{}
+				if getErr := m.k8sClient.Get(ctx, client.ObjectKey{
+					Namespace: pvc.Namespace,
+					Name:      pvc.Name,
+				}, fresh); getErr != nil {
+					return fmt.Errorf("failed to re-fetch PVC after conflict: %w", getErr)
+				}
+
+				// Re-apply only cloud-specific annotations to avoid overwriting other controllers' updates
+				if fresh.Annotations == nil {
+					fresh.Annotations = make(map[string]string)
+				}
+				for k, v := range pvc.Annotations {
+					// Only merge cloud-specific annotations
+					isCloudAnnotation := false
+					for _, prefix := range cloudAnnotationPrefixes {
+						if strings.HasPrefix(k, prefix) {
+							isCloudAnnotation = true
+							break
+						}
+					}
+					if isCloudAnnotation {
+						fresh.Annotations[k] = v
+					}
+				}
+				pvc = fresh
+				vol.PVC = fresh
+				continue
+			}
+			// Non-conflict error, fail immediately
+			return err
+		}
+		// Update succeeded
+		return nil
+	}
+	return fmt.Errorf("failed to update PVC annotations after %d retries due to conflicts", maxRetries)
 }
 
 func (m *rawModifier) modifyPVCAnnoSpec(ctx context.Context, vol *ActualVolume) error {

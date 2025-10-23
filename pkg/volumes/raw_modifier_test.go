@@ -17,6 +17,7 @@ package volumes
 import (
 	"context"
 	"testing"
+	stdtime "time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/go-logr/logr"
@@ -401,4 +402,317 @@ func Test_rawModifier_Modify(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_rawModifier_updatePVCAnnotations(t *testing.T) {
+	tests := []struct {
+		name        string
+		pvc         *corev1.PersistentVolumeClaim
+		annotations map[string]string
+		wantErr     bool
+	}{
+		{
+			name: "successful update",
+			pvc: fake.FakeObj("pvc-0",
+				withPVCSpec(ptr.To("sc-0"), "pv-0", "10Gi"),
+				withPVCStatus("10Gi"),
+			),
+			annotations: map[string]string{
+				"test-key": "test-value",
+			},
+			wantErr: false,
+		},
+		{
+			name: "update with Azure modification history",
+			pvc: fake.FakeObj("pvc-0",
+				withPVCSpec(ptr.To("sc-0"), "pv-0", "10Gi"),
+				withPVCStatus("10Gi"),
+			),
+			annotations: map[string]string{
+				"azure.tidb.pingcap.com/modify-history": `["2024-01-01T00:00:00Z"]`,
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+
+			// Setup PVC with annotations
+			if tt.pvc.Annotations == nil {
+				tt.pvc.Annotations = make(map[string]string)
+			}
+			for k, v := range tt.annotations {
+				tt.pvc.Annotations[k] = v
+			}
+
+			// Create fake client
+			cli := client.NewFakeClient(tt.pvc)
+
+			m := &rawModifier{
+				k8sClient: cli,
+				logger:    logr.Discard(),
+			}
+
+			vol := &ActualVolume{
+				PVC: tt.pvc,
+			}
+
+			err := m.updatePVCAnnotations(context.TODO(), vol)
+
+			if tt.wantErr {
+				g.Expect(err).Should(HaveOccurred())
+			} else {
+				g.Expect(err).ShouldNot(HaveOccurred())
+
+				// Verify annotations are persisted
+				var updatedPVC corev1.PersistentVolumeClaim
+				err := cli.Get(context.TODO(), client.ObjectKey{
+					Namespace: tt.pvc.Namespace,
+					Name:      tt.pvc.Name,
+				}, &updatedPVC)
+				g.Expect(err).ShouldNot(HaveOccurred())
+
+				for k, v := range tt.annotations {
+					g.Expect(updatedPVC.Annotations).Should(HaveKey(k))
+					g.Expect(updatedPVC.Annotations[k]).Should(Equal(v))
+				}
+			}
+		})
+	}
+}
+
+// modifierWithAnnotations simulates a cloud provider that sets annotations and returns wait=true
+type modifierWithAnnotations struct{}
+
+func (m *modifierWithAnnotations) Name() string {
+	return "test-cloud"
+}
+
+func (m *modifierWithAnnotations) Modify(ctx context.Context, pvc *corev1.PersistentVolumeClaim, pv *corev1.PersistentVolume, sc *storagev1.StorageClass) (bool, error) {
+	// Simulate cloud provider setting metadata in annotations
+	// Use Azure-specific annotation to test cloud annotation merging
+	if pvc.Annotations == nil {
+		pvc.Annotations = make(map[string]string)
+	}
+	pvc.Annotations["azure.tidb.pingcap.com/test-metadata"] = "test-value"
+
+	// Return wait=true to simulate rate limiting
+	return true, nil
+}
+
+func (m *modifierWithAnnotations) MinWaitDuration() stdtime.Duration {
+	return stdtime.Second
+}
+
+func (m *modifierWithAnnotations) Validate(_, _ *corev1.PersistentVolumeClaim, _, _ *storagev1.StorageClass) error {
+	return nil
+}
+
+func Test_rawModifier_Modify_PersistsAnnotationsOnWait(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	pvc := fake.FakeObj("pvc-0",
+		withPVCSpec(ptr.To("sc-0"), "pv-0", "10Gi"),
+		withPVCStatus("10Gi"),
+		withPVCAnnotation(annoKeyPVCSpecRevision, "2"),
+		withPVCAnnotation(annoKeyPVCStatusRevision, "1"),
+	)
+
+	vol := &ActualVolume{
+		PVC:   pvc,
+		Phase: VolumePhaseModifying,
+		Desired: &DesiredVolume{
+			Size:             resource.MustParse("20Gi"),
+			StorageClassName: ptr.To("sc-0"),
+		},
+		StorageClass: fake.FakeObj("sc-0", withProvisioner("test-cloud"), withAllowVolumeExpansion()),
+	}
+
+	// Create a modifier that returns wait=true (simulating rate limiting)
+	fakeModifier := &modifierWithAnnotations{}
+
+	cli := client.NewFakeClient(getObjectsFromActualVolume(vol)...)
+	m := &rawModifier{
+		k8sClient: cli,
+		logger:    logr.Discard(),
+		volumeModifiers: map[string]cloud.VolumeModifier{
+			"test-cloud": fakeModifier,
+		},
+		clock: &time.RealClock{},
+	}
+
+	// Call Modify - should return WaitError
+	err := m.Modify(context.TODO(), vol)
+	g.Expect(err).Should(HaveOccurred())
+
+	// Verify it's a WaitError
+	var waitErr *WaitError
+	g.Expect(err).Should(BeAssignableToTypeOf(waitErr))
+
+	// Verify annotations were persisted despite wait=true
+	var updatedPVC corev1.PersistentVolumeClaim
+	err = cli.Get(context.TODO(), client.ObjectKey{
+		Namespace: pvc.Namespace,
+		Name:      pvc.Name,
+	}, &updatedPVC)
+	g.Expect(err).ShouldNot(HaveOccurred())
+	g.Expect(updatedPVC.Annotations).Should(HaveKey("azure.tidb.pingcap.com/test-metadata"))
+	g.Expect(updatedPVC.Annotations["azure.tidb.pingcap.com/test-metadata"]).Should(Equal("test-value"))
+}
+
+func Test_rawModifier_Modify_OnlyMergesCloudAnnotations(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	// Setup: PVC with annotation from another controller
+	pvc := fake.FakeObj("pvc-0",
+		withPVCSpec(ptr.To("sc-0"), "pv-0", "10Gi"),
+		withPVCStatus("10Gi"),
+		withPVCAnnotation(annoKeyPVCSpecRevision, "2"),
+		withPVCAnnotation(annoKeyPVCStatusRevision, "1"),
+		withPVCAnnotation("other-controller/key", "should-not-be-overwritten"),
+		withPVCAnnotation("backup.tidb.pingcap.com/some-key", "backup-value"),
+	)
+
+	vol := &ActualVolume{
+		PVC:   pvc,
+		Phase: VolumePhaseModifying,
+		Desired: &DesiredVolume{
+			Size:             resource.MustParse("20Gi"),
+			StorageClassName: ptr.To("sc-0"),
+		},
+		StorageClass: fake.FakeObj("sc-0", withProvisioner("test-cloud"), withAllowVolumeExpansion()),
+	}
+
+	// Create a modifier that sets cloud-specific annotations
+	fakeModifier := &modifierWithAnnotations{}
+
+	cli := client.NewFakeClient(getObjectsFromActualVolume(vol)...)
+	m := &rawModifier{
+		k8sClient: cli,
+		logger:    logr.Discard(),
+		volumeModifiers: map[string]cloud.VolumeModifier{
+			"test-cloud": fakeModifier,
+		},
+		clock: &time.RealClock{},
+	}
+
+	// Call Modify
+	err := m.Modify(context.TODO(), vol)
+	g.Expect(err).Should(HaveOccurred()) // Should return WaitError
+
+	// Verify it's a WaitError
+	var waitErr *WaitError
+	g.Expect(err).Should(BeAssignableToTypeOf(waitErr))
+
+	// Verify annotations: cloud annotations merged, other annotations preserved
+	var updatedPVC corev1.PersistentVolumeClaim
+	err = cli.Get(context.TODO(), client.ObjectKey{
+		Namespace: pvc.Namespace,
+		Name:      pvc.Name,
+	}, &updatedPVC)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	// Cloud annotation should be set by modifier (but it's not in our cloudAnnotationPrefixes, so shouldn't be merged)
+	// Wait, "cloud-metadata" is not a cloud-specific annotation in our definition
+	// Let me check what the modifierWithAnnotations sets
+	g.Expect(updatedPVC.Annotations).ShouldNot(HaveKey("cloud-metadata"), "non-cloud annotation should not be merged")
+
+	// Other controller's annotation should be preserved
+	g.Expect(updatedPVC.Annotations).Should(HaveKey("other-controller/key"))
+	g.Expect(updatedPVC.Annotations["other-controller/key"]).Should(Equal("should-not-be-overwritten"))
+
+	// Backup annotation (not in cloud prefix) should be preserved
+	g.Expect(updatedPVC.Annotations).Should(HaveKey("backup.tidb.pingcap.com/some-key"))
+	g.Expect(updatedPVC.Annotations["backup.tidb.pingcap.com/some-key"]).Should(Equal("backup-value"))
+}
+
+// modifierThatSetsAzureAnnotation simulates Azure modifier setting cloud-specific annotations
+type modifierThatSetsAzureAnnotation struct{}
+
+func (m *modifierThatSetsAzureAnnotation) Name() string {
+	return "disk.csi.azure.com"
+}
+
+func (m *modifierThatSetsAzureAnnotation) Modify(ctx context.Context, pvc *corev1.PersistentVolumeClaim, pv *corev1.PersistentVolume, sc *storagev1.StorageClass) (bool, error) {
+	// Simulate Azure setting its modification history
+	if pvc.Annotations == nil {
+		pvc.Annotations = make(map[string]string)
+	}
+	pvc.Annotations["azure.tidb.pingcap.com/modify-history"] = `["2024-01-01T00:00:00Z"]`
+	pvc.Annotations["azure.tidb.pingcap.com/disk-created-at"] = "2024-01-01T00:00:00Z"
+
+	// Also try to set a non-cloud annotation (should not be merged)
+	pvc.Annotations["malicious/annotation"] = "should-not-appear"
+
+	return true, nil
+}
+
+func (m *modifierThatSetsAzureAnnotation) MinWaitDuration() stdtime.Duration {
+	return stdtime.Second
+}
+
+func (m *modifierThatSetsAzureAnnotation) Validate(_, _ *corev1.PersistentVolumeClaim, _, _ *storagev1.StorageClass) error {
+	return nil
+}
+
+func Test_rawModifier_Modify_MergesOnlyAzureCloudAnnotations(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	// Setup: PVC with annotations from another controller
+	pvc := fake.FakeObj("pvc-0",
+		withPVCSpec(ptr.To("sc-0"), "pv-0", "10Gi"),
+		withPVCStatus("10Gi"),
+		withPVCAnnotation(annoKeyPVCSpecRevision, "2"),
+		withPVCAnnotation(annoKeyPVCStatusRevision, "1"),
+		withPVCAnnotation("other-controller/key", "important-value"),
+	)
+
+	vol := &ActualVolume{
+		PVC:   pvc,
+		Phase: VolumePhaseModifying,
+		Desired: &DesiredVolume{
+			Size:             resource.MustParse("20Gi"),
+			StorageClassName: ptr.To("sc-0"),
+		},
+		StorageClass: fake.FakeObj("sc-0", withProvisioner("disk.csi.azure.com"), withAllowVolumeExpansion()),
+	}
+
+	// Create Azure modifier that sets both cloud and non-cloud annotations
+	azureModifier := &modifierThatSetsAzureAnnotation{}
+
+	cli := client.NewFakeClient(getObjectsFromActualVolume(vol)...)
+	m := &rawModifier{
+		k8sClient: cli,
+		logger:    logr.Discard(),
+		volumeModifiers: map[string]cloud.VolumeModifier{
+			"disk.csi.azure.com": azureModifier,
+		},
+		clock: &time.RealClock{},
+	}
+
+	// Call Modify
+	err := m.Modify(context.TODO(), vol)
+	g.Expect(err).Should(HaveOccurred()) // Should return WaitError
+
+	// Verify annotations were persisted correctly
+	var updatedPVC corev1.PersistentVolumeClaim
+	err = cli.Get(context.TODO(), client.ObjectKey{
+		Namespace: pvc.Namespace,
+		Name:      pvc.Name,
+	}, &updatedPVC)
+	g.Expect(err).ShouldNot(HaveOccurred())
+
+	// Azure cloud annotations should be merged
+	g.Expect(updatedPVC.Annotations).Should(HaveKey("azure.tidb.pingcap.com/modify-history"))
+	g.Expect(updatedPVC.Annotations["azure.tidb.pingcap.com/modify-history"]).Should(Equal(`["2024-01-01T00:00:00Z"]`))
+	g.Expect(updatedPVC.Annotations).Should(HaveKey("azure.tidb.pingcap.com/disk-created-at"))
+
+	// Non-cloud annotations from modifier should NOT be merged
+	g.Expect(updatedPVC.Annotations).ShouldNot(HaveKey("malicious/annotation"))
+
+	// Other controller's annotations should be preserved
+	g.Expect(updatedPVC.Annotations).Should(HaveKey("other-controller/key"))
+	g.Expect(updatedPVC.Annotations["other-controller/key"]).Should(Equal("important-value"))
 }
